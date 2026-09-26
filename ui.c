@@ -17,9 +17,15 @@ lv_obj_t * ui____initial_actions0;
 #if LV_COLOR_DEPTH != 16
     #error "LV_COLOR_DEPTH should be 16bit to match SquareLine Studio's settings"
 #endif
+/* EQTool: 이 보드(ESP32-C6-Touch-LCD-1.47 / JD9853)는 Arduino_GFX 의
+   draw16bitBeRGBBitmap() 으로 그리므로 LV_COLOR_16_SWAP 이 1 이어야 한다.
+   SquareLine 이 넣어둔 아래 검사는 자기 프리뷰 설정과 맞추라는 것일 뿐,
+   생성된 UI 코드 자체는 바이트 순서와 무관하다. 그래서 비활성화한다.
+   ※ SquareLine 에서 다시 export 하면 이 줄이 되살아나니 그때 또 지울 것.
 #if LV_COLOR_16_SWAP !=0
     #error "LV_COLOR_16_SWAP should be 0 to match SquareLine Studio's settings"
 #endif
+*/
 
 ///////////////////// ANIMATIONS ////////////////////
 

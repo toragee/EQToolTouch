@@ -8,3 +8,8 @@ build/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Waveshare 벤더 데모 (155MB). 저장소에 넣지 않는다.
+# 빌드에는 필요하므로 Waveshare 위키에서 내려받아
+# 아두이노 스케치북 라이브러리로 설치할 것. README 참고.
+ESP32-C6-Touch-LCD-1.47-Demo/

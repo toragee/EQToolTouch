@@ -1,0 +1,272 @@
+/* 웹 UI. AP 모드에는 인터넷이 없으므로 외부 CDN 을 쓸 수 없다.
+   차트는 Canvas 2D 로 직접 그린다 (의존성 0). */
+#pragma once
+#include <Arduino.h>
+
+static const char EQ_PAGE[] PROGMEM = R"HTMLPAGE(<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>EQTool</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#0C1F40;color:#e8eef8;
+  font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  overscroll-behavior:none}
+#app{display:flex;flex-direction:column;height:100%}
+header{display:flex;align-items:baseline;gap:12px;padding:10px 14px 6px;flex-wrap:wrap}
+#val{font-size:34px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+#val.neg{color:#ffb4a8}
+#unit{font-size:15px;color:#8fa6c8;margin-left:-6px}
+#meta{margin-left:auto;font-size:12px;color:#8fa6c8;text-align:right;font-variant-numeric:tabular-nums}
+#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff453a;margin-right:5px}
+#dot.on{background:#30d158}
+#wrap{flex:1;min-height:0;padding:0 6px}
+canvas{width:100%;height:100%;display:block;touch-action:none}
+footer{display:flex;gap:6px;padding:8px 10px calc(8px + env(safe-area-inset-bottom));flex-wrap:wrap}
+button,select{background:#16305c;color:#e8eef8;border:1px solid #2A4A7A;border-radius:8px;
+  padding:9px 13px;font-size:13px;font-family:inherit;cursor:pointer}
+button:active{background:#1f4076}
+button.on{background:#00E05A;border-color:#00E05A;color:#04331a;font-weight:600}
+.sp{flex:1}
+</style></head><body>
+<div id="app">
+  <header>
+    <span id="val">--.--</span><span id="unit">kPa</span>
+    <span id="meta"><span id="dot"></span><span id="stat">연결 중</span><br><span id="rate">-- Hz</span></span>
+  </header>
+  <div id="wrap"><canvas id="c"></canvas></div>
+  <footer>
+    <button id="zero">영점</button>
+    <button id="pause">일시정지</button>
+    <select id="win">
+      <option value="2">2초</option><option value="5" selected>5초</option>
+      <option value="10">10초</option><option value="30">30초</option>
+    </select>
+    <select id="yr">
+      <option value="board" selected>보드 따름</option>
+      <option value="auto">자동</option>
+      <option value="1">±1 kPa</option>
+      <option value="5">±5 kPa</option>
+      <option value="25">-5~20 kPa</option>
+      <option value="40">±40 kPa</option>
+    </select>
+    <select id="lp" title="저역통과 필터 - 낮을수록 노이즈가 줄지만 반응이 느려집니다">
+      <option value="0">필터 없음</option>
+      <option value="50">50 Hz</option>
+      <option value="20" selected>20 Hz</option>
+      <option value="5">5 Hz</option>
+      <option value="1">1 Hz</option>
+    </select>
+    <select id="band">
+      <option value="on" selected>평균+대역</option>
+      <option value="off">평균만</option>
+    </select>
+    <span class="sp"></span>
+    <button id="csv">CSV</button>
+  </footer>
+</div>
+<script>
+"use strict";
+const CAP = 60000;                       // 링버퍼 용량 (800Hz 기준 약 75초)
+const buf = new Float32Array(CAP);       // Pa
+const bts = new Float64Array(CAP);       // ms (수신 시각 기준 추정)
+let head = 0, count = 0, rate = 0, paused = false, pauseT = 0, lastPa = 0;
+let boardLo = -5000, boardHi = 20000;    // 보드가 프레임마다 실어 보내는 Y 범위
+
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, dpr = 1;
+
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+new ResizeObserver(resize).observe(cv);
+
+function push(pa, t){ buf[head] = pa; bts[head] = t; head = (head + 1) % CAP; if(count < CAP) count++; }
+
+/* ---------------- WebSocket ---------------- */
+let ws = null;
+function connect(){
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen  = () => {
+    $('dot').classList.add('on'); $('stat').textContent = '연결됨';
+    ws.send('lp:' + $('lp').value);          // 보드를 화면 설정에 맞춘다
+  };
+  ws.onclose = () => { $('dot').classList.remove('on'); $('stat').textContent = '끊김'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') return;
+    const dv = new DataView(ev.data);
+    const n  = dv.getUint16(4, true);
+    rate     = dv.getUint16(6, true);
+    boardLo  = dv.getInt16(8,  true);
+    boardHi  = dv.getInt16(10, true);
+    const now = performance.now();
+    // 프레임 안의 샘플은 등간격으로 가정하고 시각을 역산한다
+    const dt = rate > 0 ? 1000 / rate : 1.25;
+    for (let i = 0; i < n; i++){
+      const v = dv.getFloat32(12 + i * 4, true);
+      push(v, now - (n - 1 - i) * dt);
+      if (!paused) lastPa = v;
+    }
+  };
+}
+connect();
+
+/* ---------------- 그리기 ---------------- */
+function yRange(winMs, nowMs){
+  const sel = $('yr').value;
+  if (sel === 'board') return [boardLo, boardHi];
+  if (sel === '25') return [-5000, 20000];
+  if (sel === '40') return [-40000, 40000];
+  if (sel !== 'auto'){ const k = +sel * 1000; return [-k, k]; }
+  // auto: 화면에 보이는 구간의 min/max + 여유 10%
+  let lo = Infinity, hi = -Infinity;
+  const t0 = nowMs - winMs;
+  for (let i = 0; i < count; i++){
+    const idx = (head - 1 - i + CAP) % CAP;
+    if (bts[idx] < t0) break;
+    const v = buf[idx]; if (v < lo) lo = v; if (v > hi) hi = v;
+  }
+  if (!isFinite(lo)) return [-1000, 1000];
+  const pad = Math.max((hi - lo) * 0.1, 100);
+  return [lo - pad, hi + pad];
+}
+
+function fmt(pa){ return (pa / 1000).toFixed(pa > -10000 && pa < 10000 ? 2 : 1); }
+
+function draw(){
+  requestAnimationFrame(draw);
+  if (!W || !H) return;
+
+  const winMs = +$('win').value * 1000;
+  const now   = paused ? pauseT : performance.now();   /* 일시정지 = 시간축 정지 */
+  const t0    = now - winMs;
+  const [lo, hi] = yRange(winMs, now);
+  const span = (hi - lo) || 1;
+
+  const L = 46, R = 6, T = 6, B = 20;
+  const pw = W - L - R, ph = H - T - B;
+  const yOf = v => T + ph * (1 - (v - lo) / span);
+
+  ctx.clearRect(0, 0, W, H);
+
+  /* 눈금선 + Y 라벨 */
+  ctx.strokeStyle = 'rgba(42,74,122,.6)'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#6f88ad'; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+  const step = niceStep(span / 5);
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step){
+    const y = Math.round(yOf(v)) + .5;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.fillText((v / 1000).toFixed(step < 1000 ? 1 : 0), L - 6, y + 4);
+  }
+  /* 세로 눈금 (1초 간격) */
+  for (let s = 1; s < winMs / 1000; s++){
+    const x = Math.round(L + pw * (1 - s / (winMs / 1000))) + .5;
+    ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, T + ph); ctx.stroke();
+  }
+  /* 0 기준선 */
+  if (lo < 0 && hi > 0){
+    ctx.strokeStyle = '#FFE98A'; ctx.beginPath();
+    const y = Math.round(yOf(0)) + .5;
+    ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+  }
+
+  /* 데이터: 픽셀 열마다 min/max 를 세로선으로 (피크 보존 + 빠름) */
+  if (count > 1){
+    const cols = Math.max(1, Math.floor(pw));
+    const mn = new Float32Array(cols).fill(Infinity);
+    const mx = new Float32Array(cols).fill(-Infinity);
+    const sm = new Float64Array(cols);
+    const sc = new Uint32Array(cols);
+    let any = false;
+    for (let i = 0; i < count; i++){
+      const idx = (head - 1 - i + CAP) % CAP;
+      const t = bts[idx]; if (t < t0) break;
+      let c = Math.floor((t - t0) / winMs * cols);
+      if (c < 0) c = 0; else if (c >= cols) c = cols - 1;
+      const v = buf[idx];
+      if (v < mn[c]) mn[c] = v;
+      if (v > mx[c]) mx[c] = v;
+      sm[c] += v; sc[c]++;
+      any = true;
+    }
+    if (any){
+      const band = $('band').value !== 'off';
+
+      /* 1) 노이즈 대역 (픽셀 열의 min~max) 를 반투명하게 채운다 */
+      if (band){
+        ctx.fillStyle = 'rgba(0,224,90,.22)';
+        ctx.beginPath();
+        let started = false;
+        for (let c = 0; c < cols; c++){                 // 위쪽(max) 왼->오
+          if (!sc[c]) continue;
+          const x = L + c + .5, y = yOf(mx[c]);
+          started ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), started = true);
+        }
+        for (let c = cols - 1; c >= 0; c--){            // 아래쪽(min) 오->왼
+          if (!sc[c]) continue;
+          ctx.lineTo(L + c + .5, yOf(mn[c]));
+        }
+        if (started){ ctx.closePath(); ctx.fill(); }
+      }
+
+      /* 2) 평균선을 또렷하게 그린다 */
+      ctx.strokeStyle = '#00E05A';
+      ctx.lineWidth = 1.6;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      let started = false;
+      for (let c = 0; c < cols; c++){
+        if (!sc[c]) continue;
+        const x = L + c + .5, y = yOf(sm[c] / sc[c]);
+        started ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), started = true);
+      }
+      ctx.stroke();
+    }
+  }
+
+  /* 헤더 수치 */
+  const el = $('val');
+  el.textContent = fmt(lastPa);
+  el.classList.toggle('neg', lastPa < 0);
+  $('rate').textContent = rate + ' Hz';
+}
+function niceStep(raw){
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+resize(); draw();
+
+/* ---------------- 컨트롤 ---------------- */
+$('zero').onclick = () => { if (ws && ws.readyState === 1) ws.send('z'); };
+$('lp').onchange  = () => { if (ws && ws.readyState === 1) ws.send('lp:' + $('lp').value); };
+$('pause').onclick = e => {
+  /* 소켓은 그대로 두고 화면의 시간축만 멈춘다.
+     예전에는 ws.close() 를 했는데, 끊김 감지가 1초 뒤 자동 재접속시켜서
+     일시정지가 풀려버렸다. 데이터는 계속 쌓이므로 CSV 도 끊기지 않는다. */
+  paused = !paused;
+  pauseT = performance.now();
+  e.target.classList.toggle('on', paused);
+  e.target.textContent = paused ? '재개' : '일시정지';
+};
+$('csv').onclick = () => {
+  let s = 'ms,Pa\n';
+  const base = count ? bts[(head - count + CAP) % CAP] : 0;
+  for (let i = count - 1; i >= 0; i--){
+    const idx = (head - 1 - i + CAP) % CAP;
+    s += (bts[idx] - base).toFixed(1) + ',' + buf[idx].toFixed(1) + '\n';
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([s], { type: 'text/csv' }));
+  a.download = 'eqtool.csv'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+</script></body></html>
+)HTMLPAGE";
