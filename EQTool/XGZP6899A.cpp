@@ -32,9 +32,13 @@ bool XGZPA_Init(void)
 
     float mv = XGZPA_ReadMv();
 
-    if      (mv < 50.0f)                  state = -1;   /* OUT 미연결 / VDD 없음 */
-    else if (mv > XGZP_VDD_MV - 100.0f)   state = -1;   /* VDD 에 단락 / 핀 오인 */
-    else                                  state =  0;
+    /*  정상 센서의 무압 출력은 VDD 의 10~90% 안에 들어온다.
+     *  레일에 붙어 있으면 미연결이거나 출력단이 죽은 불량품이다.
+     *  (이 배치에서 3.0V / 0V 에 고착된 DOA 를 2개 겪었다) */
+    float pct = mv / XGZP_VDD_MV * 100.0f;
+    if      (pct <  5.0f)  state = -1;
+    else if (pct > 90.0f)  state = -1;
+    else                   state =  0;
 
     /* 상태가 바뀔 때만 출력한다 (재시도 루프에서 매초 도배되지 않도록) */
     if (state != last_state) {
@@ -43,10 +47,11 @@ bool XGZPA_Init(void)
             Serial.printf("[XGZP] analog OUT=GPIO%d  %.1f mV  sens %.2f mV/kPa  (+-%.0f kPa)\n",
                           XGZP_ADC_PIN, mv, XGZPA_SensMvPerKpa(), XGZP_FS_KPA);
         } else {
-            Serial.printf("[XGZP] ERROR: OUT=GPIO%d reads %.1f mV - %s\n",
-                          XGZP_ADC_PIN, mv,
-                          (mv < 50.0f) ? "OUT not connected or VDD missing"
-                                       : "OUT shorted to VDD or wrong pin");
+            Serial.printf("[XGZP] ERROR: OUT=GPIO%d reads %.1f mV (%.0f%% VDD) - %s\n",
+                          XGZP_ADC_PIN, mv, mv / XGZP_VDD_MV * 100.0f,
+                          (pct < 5.0f)
+                              ? "pinned low: OUT not connected, VDD missing, or sensor dead"
+                              : "pinned high: wrong lead, or sensor output stuck at rail");
         }
     }
     return (state == 0);

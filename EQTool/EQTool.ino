@@ -59,7 +59,7 @@ static uint8_t y_preset = 0;
 #define LOG_PERIODIC          0
 
 /* ===== 전원 끄기 =========================================================
- *  진입은 1분 무변화 자동 슬립(또는 시리얼 'o')뿐이다. 화면 롱프레스는 쓰지 않는다.
+ *  진입은 30초 무변화 자동 슬립(또는 시리얼 'o')뿐이다. 화면 롱프레스는 쓰지 않는다.
  *
  *  이 보드에는 전원을 물리적으로 끊는 회로가 없다. 그래서 "전원 끄기" 는
  *  라이트 슬립이고, 깨우기는 터치 컨트롤러의 INT(GPIO21) 레벨 웨이크업이다.
@@ -81,7 +81,7 @@ static uint8_t y_preset = 0;
  *  AUTO_SLEEP_PA 는 센서 노이즈보다 넉넉히 크게 잡아야 한다. 저역통과를
  *  거친 값을 쓰므로 200 Pa(0.2 kPa)면 충분하다. 너무 작으면 영영 안 잔다.
  * ---------------------------------------------------------------------- */
-#define AUTO_SLEEP_MS       60000   /* 무변화 지속 시간. 0 = 기능 끔 */
+#define AUTO_SLEEP_MS       30000   /* 무변화 지속 시간. 0 = 기능 끔 */
 #define AUTO_SLEEP_WARN_MS  10000   /* 남은 시간이 이보다 적으면 경고 표시 */
 #define AUTO_SLEEP_PA        200.0f /* 이보다 작은 변화는 "변화 없음" 으로 본다 */
 
@@ -264,24 +264,42 @@ static void draw_timer_cb(lv_timer_t *timer)
     }
 
     /* ===== 자동 슬립 ====================================================
-       압력이 오래 안 움직이면 잔다. 롱프레스 카운트다운이 떠 있는 동안에는
-       건드리지 않는다 (누르는 중에는 어차피 타이머가 리셋된다). */
+       압력이 오래 안 움직이면 잔다.
+
+       ※ 센서가 없거나 고장이어도 잔다. 예전에는 이 블록 전체를
+         Pressure_IsOk() 로 감싸는 바람에, 센서를 안 꽂은 보드가 영영
+         깨어 있으면서 배터리만 먹었다. 센서가 없으면 압력 변화가 있을
+         리 없으니, 오히려 자야 하는 상황이다. */
 #if AUTO_SLEEP_MS > 0
-    if (Pressure_IsOk() && !power_off_req) {
+    if (!power_off_req) {
         /* 웹으로 누가 보고 있으면 자지 않는다 */
         if (Web_GetClientCount() > 0) activity_reset();
 
         /* USB 가 꽂혀 있으면 자지 않는다 */
         if (usb_plugged()) activity_reset();
 
-        float cur = Pressure_GetFilteredPa();
-        if (fabsf(cur - idle_ref) > AUTO_SLEEP_PA) activity_reset();
+        /* 압력 변화는 센서가 정상일 때만 "활동" 으로 친다 */
+        static bool was_ok = false;
+        bool        now_ok = Pressure_IsOk();
+
+        if (now_ok) {
+            if (!was_ok) {
+                /* 막 정상이 됐다. 기준값이 낡았으므로 다시 잡는다
+                   (부팅 직후 오토제로가 끝나는 시점이 여기다) */
+                activity_reset();
+            } else {
+                float cur = Pressure_GetFilteredPa();
+                if (fabsf(cur - idle_ref) > AUTO_SLEEP_PA) activity_reset();
+            }
+        }
+        was_ok = now_ok;
 
         uint32_t idle = millis() - idle_t0;
 
         if (idle >= AUTO_SLEEP_MS) {
-            Serial.printf("[EQTool] no pressure change for %us -> auto sleep\n",
-                          (unsigned)(AUTO_SLEEP_MS / 1000));
+            Serial.printf("[EQTool] idle %us (%s) -> auto sleep\n",
+                          (unsigned)(AUTO_SLEEP_MS / 1000),
+                          Pressure_IsOk() ? "no pressure change" : "sensor not connected");
             power_off_req = true;
         } else if (idle >= AUTO_SLEEP_MS - AUTO_SLEEP_WARN_MS) {
             po_label_show("AUTO OFF IN",

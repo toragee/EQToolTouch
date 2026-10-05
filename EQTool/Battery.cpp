@@ -6,19 +6,32 @@ float Battery_ReadMv(void)
     for (uint8_t i = 0; i < BAT_OVERSAMPLE; i++)
         sum += analogReadMilliVolts(BAT_ADC_PIN);
 
-    return ((float)sum / BAT_OVERSAMPLE) * BAT_DIV_RATIO;
+    return ((float)sum / BAT_OVERSAMPLE) * BAT_DIV_RATIO * BAT_CAL;
 }
 
-/* 1셀 LiPo 방전 곡선.
-   선형 보간(3.3V=0%, 4.2V=100%)은 중간 구간이 실제와 크게 어긋나서
-   구간별 표를 쓴다. 값은 무부하 기준이라 방전 중에는 조금 낮게 나온다. */
+/* 잔량 곡선 — 200 mAh 셀을 실제로 구동하면서 측정한 기준점.
+ *
+ *      4.00 V -> 100 %
+ *      3.70 V ->  50 %
+ *      3.20 V ->   0 %
+ *
+ *  데이터시트의 무부하(OCV) 곡선이 아니라 **부하가 걸린 상태**의 값이다.
+ *  200 mAh 소용량 셀이라 내부저항이 커서, 동작 중에는 무부하보다
+ *  0.1 V 가량 낮게 측정된다. 그래서 만충 4.2 V 셀이 동작 중에는
+ *  4.0 V 근처로 읽히고, 그 지점을 100 % 로 잡았다.
+ *
+ *  즉 이 표는 "이 기기에서 이 셀을 쓸 때" 의 실측 스케일이다.
+ *  셀을 다른 용량/제조사로 바꾸면 다시 잡아야 한다.
+ *
+ *  구간 사이는 선형 보간한다. 리튬의 실제 방전 곡선은 평탄하다가
+ *  끝에서 꺾이지만, 3점 직선이 체감과 더 잘 맞는다는 판단.
+ */
 uint8_t Battery_Percent(float mv)
 {
     static const struct { uint16_t mv; uint8_t pct; } curve[] = {
-        { 4200, 100 }, { 4100,  90 }, { 4000,  80 }, { 3950,  70 },
-        { 3880,  60 }, { 3840,  50 }, { 3800,  40 }, { 3760,  30 },
-        { 3730,  20 }, { 3700,  15 }, { 3650,  10 }, { 3500,   5 },
-        { 3300,   0 },
+        { 4000, 100 },
+        { 3700,  50 },
+        { 3200,   0 },
     };
     const uint8_t n = sizeof(curve) / sizeof(curve[0]);
 
